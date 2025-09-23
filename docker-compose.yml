@@ -1,0 +1,41 @@
+services:
+  gateway:
+    build: ./services/gateway
+    image: bb-gateway
+    ports:
+      - "8080:3000"
+    environment:
+      WORKER_HOST: worker
+      WORKER_PORT: "3000"
+      META_HOST: meta
+      META_PORT: "3001"
+      MONGO_URI: mongodb://textstore:27017/bookbooker
+    depends_on:
+      - worker
+      - meta
+      - textstore
+
+  worker:
+    build: ./services/worker
+    image: bb-worker
+    expose:
+      - "3000"
+
+  meta:
+    build: ./services/meta
+    image: bb-meta
+    expose:
+      - "3001"
+
+  textstore:
+    image: mongo
+    command: --quiet --syslog
+    expose:
+      - "27017"
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+
+volumes:
+  mongo-data:
+  mongo-config:
