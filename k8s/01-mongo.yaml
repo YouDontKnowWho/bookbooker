@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-pvc
+  namespace: bookbooker
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: textstore
+  namespace: bookbooker
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: textstore } }
+  template:
+    metadata: { labels: { app: textstore } }
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:6
+          ports: [{ containerPort: 27017 }]
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          readinessProbe:
+            tcpSocket: { port: 27017 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mongo-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: textstore
+  namespace: bookbooker
+spec:
+  selector: { app: textstore }
+  ports:
+    - port: 27017
+      targetPort: 27017
