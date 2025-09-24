@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>BookBooker</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: ui-sans-serif, system-ui, Arial, sans-serif; margin: 24px; max-width: 900px; }
+      input, button { padding: 8px; font-size: 16px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+      .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+      h2 { margin: 16px 0 8px; }
+      code { background: #f4f4f4; padding: 2px 4px; border-radius: 4px; }
+      ul { padding-left: 20px; }
+    </style>
+  </head>
+  <body>
+    <h1>BookBooker</h1>
+
+    <div class="row">
+      <input id="q" placeholder="Search books (e.g. Tolkien)" style="flex:1" />
+      <button id="go">Search</button>
+    </div>
+
+    <div class="cols">
+      <div class="card">
+        <h2>Results</h2>
+        <div id="results">-</div>
+      </div>
+      <div class="card">
+        <h2>Definition</h2>
+        <div id="def">-</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>Favorites</h2>
+      <button id="reloadFavs">Reload</button>
+      <div id="favs">-</div>
+    </div>
+
+    <script>
+      async function api(path, opts) {
+        const r = await fetch(path, opts);
+        if (!r.ok) throw new Error(await r.text());
+        const ct = r.headers.get('content-type') || '';
+        return ct.includes('application/json') ? r.json() : r.text();
+      }
+
+      function el(tag, attrs = {}, ...children) {
+        const e = document.createElement(tag);
+        Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
+        children.forEach(c => e.append(typeof c === 'string' ? document.createTextNode(c) : c));
+        return e;
+      }
+
+      function normalizeResults(data) {
+        const arr = Array.isArray(data) ? data : (data.books || data.results || data.items || []);
+        return arr.map(x => {
+          const title = x.title || x.name || 'untitled';
+          const authors = Array.isArray(x.authors) ? x.authors
+                        : Array.isArray(x.author_name) ? x.author_name
+                        : (x.author ? [x.author] : []);
+          const author = authors[0] || x.author || 'unknown';
+          const year = x.year || x.first_publish_year || '';
+          const id = x.id || x.key || (Array.isArray(x.isbn) ? x.isbn[0] : x.isbn) || `${title}:${author}`;
+          return { id, title, authors, author, year, raw: x };
+        });
+      }
+
+      async function search() {
+        const q = document.getElementById('q').value.trim();
+        if (!q) return;
+        document.getElementById('results').textContent = 'Searching...';
+        document.getElementById('def').textContent = 'Loading...';
+        try {
+          const data = await api('/api/search?q=' + encodeURIComponent(q));
+          const items = normalizeResults(data);
+
+          const resDiv = el('div');
+          items.forEach(b => {
+            const line = el('div', {},
+              el('strong', {}, b.title || 'untitled'),
+              ' — ',
+              b.author || 'unknown',
+              b.year ? ` (${b.year})` : ''
+            );
+            const btn = el('button', { style: 'margin-left:8px' });
+            btn.textContent = 'Save';
+            btn.onclick = async () => {
+              await api('/api/favorites', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: b.id, title: b.title, authors: b.authors, author: b.author, year: b.year })
+              });
+              await loadFavs();
+            };
+            line.append(btn);
+            resDiv.append(line);
+          });
+          document.getElementById('results').replaceChildren(resDiv);
+
+          const defs = (data.definition || data.definitions || []);
+          const defNode = defs.length ? el('ul', {}, ...defs.map(d => el('li', {}, d))) : document.createTextNode('–');
+          document.getElementById('def').replaceChildren(defNode);
+        } catch (e) {
+          document.getElementById('results').textContent = 'Error: ' + e.message;
+          document.getElementById('def').textContent = 'Error';
+        }
+      }
+
+      async function loadFavs() {
+        const data = await api('/api/favorites');
+        const favs = Array.isArray(data) ? data : (data.items || data.favorites || []);
+        const wrap = el('div');
+        favs.forEach(f => {
+          const line = el('div', {},
+            `${f.title} — ${(Array.isArray(f.authors) && f.authors[0]) || f.author || 'unknown'} ${f.year ? '(' + f.year + ')' : ''}`
+          );
+          // Delete may require backend support; ignore errors if not implemented yet.
+          const del = el('button', { style: 'margin-left:8px' });
+          del.textContent = 'Delete';
+          del.onclick = async () => {
+            try { await api('/api/favorites/' + (f._id || f.id), { method: 'DELETE' }); } catch (_) {}
+            await loadFavs();
+          };
+          line.append(del);
+          wrap.append(line);
+        });
+        document.getElementById('favs').replaceChildren(wrap);
+      }
+
+      document.getElementById('go').onclick = search;
+      document.getElementById('reloadFavs').onclick = loadFavs;
+      loadFavs();
+    </script>
+  </body>
+</html>

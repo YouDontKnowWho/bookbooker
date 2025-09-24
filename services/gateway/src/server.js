@@ -2,64 +2,96 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-const WORKER_HOST = process.env.WORKER_HOST || 'worker';
-const WORKER_PORT = process.env.WORKER_PORT || '3000';
-const META_HOST   = process.env.META_HOST   || 'meta';
-const META_PORT   = process.env.META_PORT   || '3001';
+import { favorites, ObjectId } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
+const WORKER_HOSTS = (process.env.WORKER_HOSTS || 'worker').split(',');
+const WORKER_PORT  = process.env.WORKER_PORT  || '3000';
+const META_HOST    = process.env.META_HOST    || 'meta';
+const META_PORT    = process.env.META_PORT    || '3001';
+
+function pickWorker() {
+  const list = WORKER_HOSTS.map(s => s.trim()).filter(Boolean);
+  return `http://${list[Math.floor(Math.random()*list.length)]}:${WORKER_PORT}`;
+}
+
+const app = express();
 app.use(express.json());
 
-// health
-app.get('/healthz', (_req, res) => res.send('ok'));
+// Static UI
+app.use(express.static(__dirname));
 
-// serve UI (index.html lives in src/)
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
+// Health
+app.get('/healthz', (req,res)=>res.send('ok'));
 
-// proxy → worker: search books
+// ---- API ----
+// helper: make any meta payload into string[]
+function normalizeDefs(x) {
+  if (!x) return [];
+  if (Array.isArray(x)) return x;                 // already ["a","b"]
+  if (typeof x === 'string') return [x];          // single string
+  // common dictionaryapi.dev shape
+  if (Array.isArray(x.meanings)) {
+    return x.meanings.flatMap(m =>
+      (m.definitions || []).map(d => d.definition).filter(Boolean)
+    );
+  }
+  if (Array.isArray(x.definitions)) return x.definitions;
+  return [];
+}
+
 app.get('/api/search', async (req, res) => {
-  const q = encodeURIComponent(req.query.q || '');
+  const q = (req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+
   try {
-    const r = await fetch(`http://${WORKER_HOST}:${WORKER_PORT}/search?q=${q}`);
-    const data = await r.json();
-    res.json(data);
+    const [rawBooks, rawDef] = await Promise.all([
+      fetch(`${pickWorker()}/search?q=${encodeURIComponent(q)}`).then(r => r.json()),
+      fetch(`http://${META_HOST}:${META_PORT}/define?q=${encodeURIComponent(q)}`)
+        .then(r => (r.ok ? r.json() : null))
+        .catch(() => null),
+    ]);
+
+    // 🔧 Always give the UI an array
+    const books =
+      Array.isArray(rawBooks?.books) ? rawBooks.books :
+      Array.isArray(rawBooks)        ? rawBooks :
+      [];
+
+    const definition = normalizeDefs(rawDef).slice(0, 5);
+
+    res.json({ books, definition });
   } catch (e) {
-    res.status(502).json({ error: 'worker_unreachable', detail: e.message });
+    console.error(e);
+    res.status(500).json({ error: 'search failed' });
   }
 });
 
-// proxy → meta: list favorites
-app.get('/api/favorites', async (_req, res) => {
+
+app.get('/api/favorites', async (req,res)=>{
+  res.json(await favorites.find().sort({ _id: -1 }).toArray());
+});
+
+app.post('/api/favorites', async (req,res)=>{
+  const { title, author, year } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const { insertedId } = await favorites.insertOne({ title, author, year, createdAt: new Date() });
+  res.status(201).json({ _id: insertedId, title, author, year });
+});
+
+app.delete('/api/favorites/:id', async (req,res)=>{
   try {
-    const r = await fetch(`http://${META_HOST}:${META_PORT}/favorites`);
-    const data = await r.json();
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: 'meta_unreachable', detail: e.message });
+    await favorites.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: 'bad id' });
   }
 });
 
-// proxy → meta: add favorite
-app.post('/api/favorites', async (req, res) => {
-  try {
-    const r = await fetch(`http://${META_HOST}:${META_PORT}/favorites`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(req.body),
-    });
-    const data = await r.json();
-    res.status(r.status).json(data);
-  } catch (e) {
-    res.status(502).json({ error: 'meta_unreachable', detail: e.message });
-  }
-});
+// SPA fallback
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('gateway listening on', PORT));
