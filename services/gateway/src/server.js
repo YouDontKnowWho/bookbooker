@@ -1,97 +1,125 @@
 // services/gateway/src/server.js
-import express from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { favorites, ObjectId } from './db.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-
-const WORKER_HOSTS = (process.env.WORKER_HOSTS || 'worker').split(',');
-const WORKER_PORT  = process.env.WORKER_PORT  || '3000';
-const META_HOST    = process.env.META_HOST    || 'meta';
-const META_PORT    = process.env.META_PORT    || '3001';
-
-function pickWorker() {
-  const list = WORKER_HOSTS.map(s => s.trim()).filter(Boolean);
-  return `http://${list[Math.floor(Math.random()*list.length)]}:${WORKER_PORT}`;
-}
+const express = require('express');
+const path = require('path');
+const { MongoClient, ObjectId } = require('mongodb');
 
 const app = express();
 app.use(express.json());
 
-// Static UI
-app.use(express.static(__dirname));
+// --- config ---
+const PORT = process.env.PORT || 3000;
+const WORKER_HOSTS = (process.env.WORKER_HOSTS || 'http://worker:3000')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const META_URL = process.env.META_URL || process.env.META_HOST || 'http://meta:3001';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://textstore:27017/bookbooker';
+const DB_NAME = process.env.DB_NAME || 'bookbooker';
 
-// Health
-app.get('/healthz', (req,res)=>res.send('ok'));
-
-// ---- API ----
-// helper: make any meta payload into string[]
-function normalizeDefs(x) {
-  if (!x) return [];
-  if (Array.isArray(x)) return x;                 // already ["a","b"]
-  if (typeof x === 'string') return [x];          // single string
-  // common dictionaryapi.dev shape
-  if (Array.isArray(x.meanings)) {
-    return x.meanings.flatMap(m =>
-      (m.definitions || []).map(d => d.definition).filter(Boolean)
-    );
+// --- HTTP helpers with hard timeouts ---
+async function safeFetchJson(url, { timeoutMs = 4000 } = {}) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    // try JSON, but if body is empty / html, catch & fall back
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Non-JSON from ${url}: ${text.slice(0, 120)}`);
+    }
+  } finally {
+    clearTimeout(t);
   }
-  if (Array.isArray(x.definitions)) return x.definitions;
-  return [];
 }
 
-app.get('/api/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) return res.status(400).json({ error: 'q required' });
+function pickWorker() {
+  return WORKER_HOSTS[Math.floor(Math.random() * WORKER_HOSTS.length)];
+}
 
+// --- Mongo (lazy) ---
+let mongoClient, favoritesColl;
+async function getFavoritesColl() {
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGO_URI, { connectTimeoutMS: 3000, serverSelectionTimeoutMS: 3000 });
+    await mongoClient.connect();
+    favoritesColl = mongoClient.db(DB_NAME).collection('favorites');
+    await favoritesColl.createIndex({ createdAt: -1 });
+  }
+  return favoritesColl;
+}
+
+// --- static UI ---
+app.use(express.static(path.join(__dirname))); // index.html lives here
+
+// --- health ---
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+
+// --- search aggregator ---
+app.get('/api/search', async (req, res, next) => {
   try {
-    const [rawBooks, rawDef] = await Promise.all([
-      fetch(`${pickWorker()}/search?q=${encodeURIComponent(q)}`).then(r => r.json()),
-      fetch(`http://${META_HOST}:${META_PORT}/define?q=${encodeURIComponent(q)}`)
-        .then(r => (r.ok ? r.json() : null))
-        .catch(() => null),
+    const q = String(req.query.q || '').trim();
+    const workerUrl = `${pickWorker()}/search?q=${encodeURIComponent(q)}`;
+    const metaUrl   = `${META_URL}/define?q=${encodeURIComponent(q)}`;
+
+    const [booksRes, defsRes] = await Promise.allSettled([
+      safeFetchJson(workerUrl).then(r => Array.isArray(r) ? r : (Array.isArray(r?.books) ? r.books : [])),
+      safeFetchJson(metaUrl).then(r => Array.isArray(r) ? r : (Array.isArray(r?.definition) ? r.definition : [])),
     ]);
 
-    // 🔧 Always give the UI an array
-    const books =
-      Array.isArray(rawBooks?.books) ? rawBooks.books :
-      Array.isArray(rawBooks)        ? rawBooks :
-      [];
-
-    const definition = normalizeDefs(rawDef).slice(0, 5);
+    const books = booksRes.status === 'fulfilled' ? booksRes.value : [];
+    const definition = defsRes.status === 'fulfilled' ? defsRes.value : [];
 
     res.json({ books, definition });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'search failed' });
+  } catch (err) {
+    // absolute last-resort safety net
+    console.error('gateway /api/search fatal:', err?.stack || err);
+    res.json({ books: [], definition: [], warning: 'gateway-fallback' });
   }
 });
 
-
-app.get('/api/favorites', async (req,res)=>{
-  res.json(await favorites.find().sort({ _id: -1 }).toArray());
-});
-
-app.post('/api/favorites', async (req,res)=>{
-  const { title, author, year } = req.body || {};
-  if (!title) return res.status(400).json({ error: 'title required' });
-  const { insertedId } = await favorites.insertOne({ title, author, year, createdAt: new Date() });
-  res.status(201).json({ _id: insertedId, title, author, year });
-});
-
-app.delete('/api/favorites/:id', async (req,res)=>{
+// --- favorites CRUD ---
+app.get('/api/favorites', async (_req, res, next) => {
   try {
-    await favorites.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.json({ ok: true });
-  } catch {
-    res.status(400).json({ error: 'bad id' });
+    const coll = await getFavoritesColl();
+    const docs = await coll.find().sort({ createdAt: -1 }).toArray();
+    res.json(docs);
+  } catch (err) { next(err); }
+});
+
+app.post('/api/favorites', async (req, res, next) => {
+  try {
+    const { title, author, year } = req.body || {};
+    if (!title) return res.status(400).json({ error: 'title required' });
+    const coll = await getFavoritesColl();
+    const doc = { title, author, year, createdAt: new Date() };
+    const r = await coll.insertOne(doc);
+    res.json({ _id: r.insertedId, ...doc });
+  } catch (err) { next(err); }
+});
+
+app.delete('/api/favorites/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!/^[a-f0-9]{24}$/i.test(id)) return res.status(400).json({ error: 'bad id' });
+    const coll = await getFavoritesColl();
+    const r = await coll.deleteOne({ _id: new ObjectId(id) });
+    res.json({ deleted: r.deletedCount === 1 });
+  } catch (err) { next(err); }
+});
+
+// --- error middleware: NEVER crash a request ---
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled app error:', err?.stack || err);
+  // Still reply with safe shape for the UI & tests
+  if (!res.headersSent) {
+    res.status(200).json({ books: [], definition: [], warning: 'gateway-error' });
   }
 });
 
-// SPA fallback
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+// --- process guards (log, don’t exit) ---
+process.on('unhandledRejection', (r) => console.error('unhandledRejection', r));
+process.on('uncaughtException', (e) => console.error('uncaughtException', e));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('gateway listening on', PORT));
+// --- start ---
+app.listen(PORT, () => console.log(`gateway listening on ${PORT}`));

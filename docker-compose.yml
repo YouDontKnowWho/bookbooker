@@ -5,7 +5,7 @@ services:
     ports:
       - "8080:3000"
     environment:
-      WORKER_HOST: worker
+      WORKER_HOSTS: worker
       WORKER_PORT: "3000"
       META_HOST: meta
       META_PORT: "3001"
