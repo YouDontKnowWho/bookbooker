@@ -2,6 +2,7 @@
 
 
 **Repository:** https://github.com/jackspawwow/bookbooker
+**Video walkthrough (5–10 min):** https://youtu.be/PC6MfOac5sY
 
 **BookBooker** is a tiny microservice application that searches for books and (optionally) returns a short definition for the query. It also lets you save “favorites” in MongoDB with **persistent storage**.
 
@@ -75,3 +76,4 @@ flowchart LR
 - Resource requests/limits.
 - AuthN/AuthZ (e.g., JWT) for `/api/favorites`.
 - Caching/rate limits when `OPENLIB=true`.
+
